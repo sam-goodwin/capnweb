@@ -4,6 +4,9 @@
 
 // This file borrows heavily from `types/defines/rpc.d.ts` in workerd.
 
+import type { Effect } from "effect/Effect";
+import type { Stream } from "effect/Stream";
+
 // Branded types for identifying `WorkerEntrypoint`/`DurableObject`/`Target`s.
 // TypeScript uses *structural* typing meaning anything with the same shape as type `T` is a `T`.
 // For the classes exported by `cloudflare:workers` we want *nominal* typing (i.e. we only want to
@@ -20,6 +23,22 @@ export interface RpcTargetBranded {
 // `never[]` preserves compatibility with strongly-typed function signatures without introducing
 // `any` into inference.
 export type Stubable = RpcTargetBranded | ((...args: never[]) => unknown);
+
+// Unwrap Effect<A, E, R> to A, similar to how Awaited unwraps Promise<T>.
+// Also handles Stream<A, E, R> -> ReadableStream<A>.
+type UnwrapEffect<T> =
+  T extends Effect<infer A, any, any> ? A
+  : T;
+
+type UnwrapStream<T> =
+  T extends Stream<infer A, any, any> ? ReadableStream<A>
+  : T;
+
+// Combined unwrapper: first check Stream, then Effect, then Awaited for Promise.
+type AwaitedOrEffect<T> =
+  T extends Stream<infer A, any, any> ? ReadableStream<A>
+  : T extends Effect<infer A, any, any> ? A
+  : Awaited<T>;
 
 type IsUnknown<T> = unknown extends T ? ([T] extends [unknown] ? true : false) : false;
 
@@ -44,6 +63,9 @@ export type RpcCompatible<T> =
       [K in keyof T as K extends string | number ? K : never]: RpcCompatible<T[K]>;
     }
   | Promise<T extends Promise<infer U> ? RpcCompatible<U> : never>
+  // Effect types: Effect<A, E, R> is treated like Promise<A>, Stream<A, E, R> like ReadableStream
+  | Effect<T extends Effect<infer A, any, any> ? RpcCompatible<A> : never, any, any>
+  | Stream<T extends Stream<infer A, any, any> ? RpcCompatible<A> : never, any, any>
   // Special types
   | Stub<Stubable>
   // Serialized as stubs, see `Stubify`
@@ -97,6 +119,8 @@ type BaseType =
 export type Stubify<T> =
   T extends Stubable ? Stub<T>
   : T extends Promise<infer U> ? Stubify<U>
+  : T extends Effect<infer A, any, any> ? Stubify<A>
+  : T extends Stream<infer A, any, any> ? ReadableStream<A>
   : T extends StubBase<any> ? T
   : T extends Map<infer K, infer V> ? Map<Stubify<K>, Stubify<V>>
   : T extends Set<infer V> ? Set<Stubify<V>>
@@ -120,6 +144,8 @@ type UnstubifyInner<T> =
   // is already assignable to the value type (important for callback contextual typing).
   T extends StubBase<infer V> ? (T extends V ? UnstubifyInner<V> : (T | UnstubifyInner<V>))
   : T extends Promise<infer U> ? UnstubifyInner<U>
+  : T extends Effect<infer A, any, any> ? UnstubifyInner<A>
+  : T extends Stream<infer A, any, any> ? ReadableStream<A>
   : T extends Map<infer K, infer V> ? Map<Unstubify<K>, Unstubify<V>>
   : T extends Set<infer V> ? Set<Unstubify<V>>
   : T extends [] ? []
@@ -182,8 +208,8 @@ type UnknownResult = Promise<unknown> & Provider<unknown> & StubBase<unknown>;
 // For properties, rewrite types to be `Result`s.
 // In each case, unwrap `Promise`s.
 type MethodOrProperty<V> = V extends (...args: infer P) => infer R
-  ? (...args: UnstubifyAll<P>) => IsAny<R> extends true ? UnknownResult : Result<Awaited<R>>
-  : Result<Awaited<V>>;
+  ? (...args: UnstubifyAll<P>) => IsAny<R> extends true ? UnknownResult : Result<AwaitedOrEffect<R>>
+  : Result<AwaitedOrEffect<V>>;
 
 // Type for the callable part of an `Provider` if `T` is callable.
 // This is intersected with methods/properties.

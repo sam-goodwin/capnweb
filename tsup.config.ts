@@ -7,7 +7,7 @@ import { defineConfig } from 'tsup'
 export default defineConfig({
   entry: ['src/index.ts', 'src/index-workers.ts'],
   format: ['esm', 'cjs'],
-  external: ['cloudflare:workers'],
+  external: ['cloudflare:workers', 'effect'],
   dts: true,
   sourcemap: true,
   clean: true,

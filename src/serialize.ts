@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook, streamToReadable, EffectStubHook } from "./core.js";
 
 export type ImportId = number;
 export type ExportId = number;
@@ -362,6 +362,26 @@ export class Devaluator {
 
         let hook = this.source.getHookForRpcTarget(<RpcTarget>value, parent);
         return this.devaluateHook("promise", hook);
+      }
+
+      case "effect": {
+        if (!this.source) {
+          throw new Error("Can't serialize Effect values in this context.");
+        }
+
+        let hook = new EffectStubHook(value);
+        return this.devaluateHook("promise", hook);
+      }
+
+      case "effect-stream": {
+        if (!this.source) {
+          throw new Error("Can't serialize Effect Stream in this context.");
+        }
+
+        let readable = streamToReadable(value);
+        let hook = this.source.getHookForReadableStream(readable, parent);
+        let importId = this.exporter.createPipe(readable, hook);
+        return ["readable", importId];
       }
 
       case "writable": {

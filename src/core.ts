@@ -5,6 +5,56 @@
 import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
 import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
 
+// Effect is an optional dependency. We detect Effect and Stream values at
+// runtime via their brand keys ("~effect/Effect", "~effect/Stream") so that
+// core.ts never needs a top-level import of "effect". The actual effect
+// package is loaded lazily (via dynamic import) only when we need to execute
+// an Effect or convert a Stream — which only happens if the user actually
+// returns these types from RPC methods.
+const EFFECT_BRAND = "~effect/Effect";
+const STREAM_BRAND = "~effect/Stream";
+
+// Check for Effect/Stream brands on the prototype chain WITHOUT triggering
+// Proxy `has` traps (which would cause false positives on RpcStub proxies).
+function hasBrandOnPrototype(value: object, brand: string): boolean {
+  try {
+    let proto = Object.getPrototypeOf(value);
+    while (proto !== null && proto !== Object.prototype) {
+      if (Object.prototype.hasOwnProperty.call(proto, brand)) return true;
+      proto = Object.getPrototypeOf(proto);
+    }
+  } catch {
+    // Some exotic objects (e.g. workerd Durable Object stubs) may throw
+    // when their prototype chain is accessed.
+  }
+  return false;
+}
+
+function isEffectValue(value: unknown): boolean {
+  return typeof value === "object" && value !== null && hasBrandOnPrototype(value, EFFECT_BRAND);
+}
+
+function isStreamValue(value: unknown): boolean {
+  return typeof value === "object" && value !== null && hasBrandOnPrototype(value, STREAM_BRAND);
+}
+
+let _effectModule: any;
+let _effectModulePromise: Promise<any> | undefined;
+
+function ensureEffectModule(): Promise<any> {
+  if (_effectModule) return Promise.resolve(_effectModule);
+  if (!_effectModulePromise) {
+    _effectModulePromise = import("effect").then(
+      mod => { _effectModule = mod; return mod; },
+      () => { throw new Error(
+        "The 'effect' package is required to use Effect/Stream values over RPC. " +
+        "Install it with: npm install effect"
+      ); }
+    );
+  }
+  return _effectModulePromise;
+}
+
 // Polyfill Symbol.dispose for browsers that don't support it yet
 if (!Symbol.dispose) {
   (Symbol as any).dispose = Symbol.for('dispose');
@@ -39,7 +89,8 @@ export type PropertyPath = (string | number)[];
 
 type TypeForRpc = "unsupported" | "primitive" | "object" | "function" | "array" | "date" |
     "bigint" | "bytes" | "stub" | "rpc-promise" | "rpc-target" | "rpc-thenable" | "error" |
-    "undefined" | "writable" | "readable" | "headers" | "request" | "response";
+    "undefined" | "writable" | "readable" | "headers" | "request" | "response" |
+    "effect" | "effect-stream";
 
 const AsyncFunction = (async function () {}).constructor;
 
@@ -145,6 +196,16 @@ export function typeForRpc(value: unknown): TypeForRpc {
         return "error";
       }
 
+      // Effect checks are placed after RpcTarget and Error to avoid false positives
+      // from proxy traps (e.g. RpcStub proxies report `has` as true for all strings).
+      if (isStreamValue(value)) {
+        return "effect-stream";
+      }
+
+      if (isEffectValue(value)) {
+        return "effect";
+      }
+
       return "unsupported";
   }
 }
@@ -191,6 +252,21 @@ export type StreamImpl = {
   // Creates a minimal StubHook wrapping a local ReadableStream for disposal tracking.
   // The hook's dispose() will cancel the stream.
   createReadableStreamHook(stream: ReadableStream): StubHook;
+}
+
+function causeToError(mod: any, cause: unknown): Error {
+  const squashed = mod.Cause.squash(cause);
+  if (squashed instanceof Error) return squashed;
+  return new Error(String(squashed));
+}
+
+export function streamToReadable(stream: unknown): ReadableStream {
+  if (!_effectModule) {
+    throw new Error(
+      "The 'effect' package must be loaded before streamToReadable can be used."
+    );
+  }
+  return _effectModule.Stream.toReadableStream(stream) as unknown as ReadableStream;
 }
 
 // Inner interface backing an RpcStub or RpcPromise.
@@ -1019,6 +1095,27 @@ export class RpcPayload {
         return promise;
       }
 
+      case "effect": {
+        let hook = new EffectStubHook(value);
+        let promise = new RpcPromise(hook, []);
+        this.promises!.push({parent, property, promise});
+        return promise;
+      }
+
+      case "effect-stream": {
+        // In deepCopy, the module should already be loaded by deliverCall.
+        // If not, streamToReadable will throw a clear error.
+        let readable = streamToReadable(value);
+        let hook: StubHook;
+        if (owner) {
+          hook = owner.getHookForReadableStream(readable, oldParent, dupStubs);
+        } else {
+          hook = streamImpl.createReadableStreamHook(readable);
+        }
+        this.hooks!.push(hook);
+        return readable;
+      }
+
       case "writable": {
         let stream = <WritableStream>value;
         let hook: StubHook;
@@ -1186,6 +1283,17 @@ export class RpcPayload {
         // since that will actually wait for the promise. Instead we want to construct a payload
         // around it directly.
         return RpcPayload.fromAppReturn(result);
+      } else if (result instanceof RpcStub) {
+        // RpcStub returned directly — wrap it as a return value. Must be checked before
+        // Effect because proxy traps can cause false positives on Effect.isEffect().
+        return RpcPayload.fromAppReturn(result);
+      } else if (isStreamValue(result)) {
+        let mod = await ensureEffectModule();
+        return RpcPayload.fromAppReturn(
+            mod.Stream.toReadableStream(result) as unknown as ReadableStream);
+      } else if (isEffectValue(result)) {
+        return RpcPayload.fromAppReturn(
+            new RpcPromise(new EffectStubHook(result), []));
       } else {
         // In all other cases, await the result (which may or may not be a promise, but `await`
         // will just pass through non-promises).
@@ -1327,6 +1435,16 @@ export class RpcPayload {
         // Since thenables are promises, we don't own them, so we don't dispose them.
         return;
 
+      case "effect":
+        // Effects are lazy descriptions — nothing to dispose on their own.
+        return;
+
+      case "effect-stream":
+        // Effect streams have already been converted to ReadableStream during deepCopy,
+        // so by the time disposeImpl runs on a "return" source, the value is still the
+        // original stream object. Treat it like a readable.
+        return;
+
       case "headers":
         // Headers have no owned resources to dispose.
         return;
@@ -1419,6 +1537,8 @@ export class RpcPayload {
       case "headers":
       case "request":
       case "response":
+      case "effect":
+      case "effect-stream":
         return;
 
       case "array": {
@@ -1571,6 +1691,8 @@ function followPath(value: unknown, parent: object | undefined,
       case "headers":
       case "request":
       case "response":
+      case "effect":
+      case "effect-stream":
         // These have no properties that can be accessed remotely.
         value = undefined;
         break;
@@ -1993,6 +2115,87 @@ export class PromiseStubHook extends StubHook {
       this.promise.then(hook => {
         hook.onBroken(callback);
       }, callback);
+    }
+  }
+}
+
+// Wraps an Effect<A, E, never> in a StubHook that integrates with Cap'n Web's
+// promise pipelining. The Effect is only executed when Cap'n Web pulls or
+// pipelines through it — preserving laziness.
+export class EffectStubHook extends StubHook {
+  private effect: unknown;
+  private inner: PromiseStubHook | undefined;
+
+  constructor(effect: unknown) {
+    super();
+    this.effect = effect;
+  }
+
+  private getInner(): PromiseStubHook {
+    if (!this.inner) {
+      if (!this.effect) {
+        throw new Error("EffectStubHook used after disposal.");
+      }
+      const eff = this.effect;
+      this.inner = new PromiseStubHook(
+        ensureEffectModule().then(mod => {
+          return mod.Effect.runPromiseExit(eff).then((exit: any) => {
+            if (mod.Exit.isSuccess(exit)) {
+              return new PayloadStubHook(RpcPayload.fromAppReturn(exit.value));
+            } else {
+              throw causeToError(mod, exit.cause);
+            }
+          });
+        })
+      );
+    }
+    return this.inner;
+  }
+
+  call(path: PropertyPath, args: RpcPayload): StubHook {
+    return this.getInner().call(path, args);
+  }
+
+  stream(path: PropertyPath, args: RpcPayload): { promise: Promise<void>; size?: number } {
+    return this.getInner().stream(path, args);
+  }
+
+  map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
+    return this.getInner().map(path, captures, instructions);
+  }
+
+  get(path: PropertyPath): StubHook {
+    return this.getInner().get(path);
+  }
+
+  dup(): StubHook {
+    if (this.inner) {
+      return this.inner.dup();
+    }
+    return new EffectStubHook(this.effect!);
+  }
+
+  pull(): RpcPayload | Promise<RpcPayload> {
+    return this.getInner().pull();
+  }
+
+  ignoreUnhandledRejections(): void {
+    if (this.inner) {
+      this.inner.ignoreUnhandledRejections();
+    }
+  }
+
+  dispose(): void {
+    if (this.inner) {
+      this.inner.dispose();
+      this.inner = undefined;
+    }
+    this.effect = undefined;
+  }
+
+  onBroken(callback: (error: any) => void): void {
+    if (this.inner) {
+      this.inner.onBroken(callback);
     }
   }
 }

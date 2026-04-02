@@ -56,5 +56,11 @@
   "bugs": {
     "url": "https://github.com/cloudflare/capnweb/issues"
   },
-  "homepage": "https://github.com/cloudflare/capnweb#readme"
+  "homepage": "https://github.com/cloudflare/capnweb#readme",
+  "dependencies": {
+    "@effect/platform-bun": "^4.0.0-beta.38",
+    "@effect/platform-node": "^4.0.0-beta.38",
+    "@effect/platform-node-shared": "^4.0.0-beta.38",
+    "effect": "^4.0.0-beta.38"
+  }
 }

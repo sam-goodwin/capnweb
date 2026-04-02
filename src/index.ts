@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl } from "./core.js";
+import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl, streamToReadable } from "./core.js";
 import { serialize, deserialize } from "./serialize.js";
 import { RpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
@@ -13,13 +13,14 @@ import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
 import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
 import { forceInitMap } from "./map.js";
 import { forceInitStreams } from "./streams.js";
+import { readableToStream } from "./effect.js";
 
 forceInitMap();
 forceInitStreams();
 
 // Re-export public API types.
 export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
-         nodeHttpBatchRpcResponse };
+         nodeHttpBatchRpcResponse, readableToStream, streamToReadable };
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
 
 // Hack the type system to make RpcStub's types work nicely!
